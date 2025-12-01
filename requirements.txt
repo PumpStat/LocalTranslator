@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pydantic
+transformers>=4.44.0
+accelerate>=0.29.0
+bitsandbytes>=0.43.0
+sentencepiece
+python-dotenv
+protobuf
