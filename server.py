@@ -1,9 +1,10 @@
 from typing import List, Dict, Optional, Tuple
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM
 import torch, json, os, re
 from dotenv import load_dotenv
+from threading import Lock
 
 try:
     from transformers import BitsAndBytesConfig
@@ -315,12 +316,57 @@ def _restore_placeholders(text: str, placeholders: Dict[str, str]) -> str:
         restored = re.sub(rf"(?i)\[\s*TAG\s*{n}\s*\]", val, restored)
     return restored
 
+
+def _enforce_tag_glossary(text: str, src: str, tgt: str) -> str:
+    """
+    Final safeguard after model generation: replace any leftover source-language tags
+    with their exact target-language mapping.
+    """
+    table = tag_table_for_target(tgt)
+    src_map = _build_source_tag_map(src)
+    result = text
+
+    def _replace_latin(surface: str, replacement: str, buf: str) -> str:
+        pattern = re.compile(rf"(?i)(?<![A-Za-z]){re.escape(surface)}(?![A-Za-z])")
+        return pattern.sub(replacement, buf)
+
+    for surface, en_key in sorted(src_map.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if not surface:
+            continue
+        replacement = table.get(en_key, en_key)
+        if surface == replacement:
+            continue
+        if re.search(r"[A-Za-z]", surface):
+            result = _replace_latin(surface, replacement, result)
+        else:
+            result = result.replace(surface, replacement)
+    return result
+
 # ===== 보호 대상: 심플하게 프롬프트에만 명시(치환/검증 없음) =====
 DEFAULT_AUTHORS = ["EXC", "SPHAM", "DULKI", "SUNNY", "FEFEMZ"]  # 채보 제작자
 DEFAULT_CHART_NAMES = [
     "Pandora", "District V", "Prime Time", "Full Moon"
     # 필요한 채보명 계속 추가 가능
 ]
+MAX_CHART_NAME_COUNT = 2000
+MAX_CHART_NAME_LEN = 200
+_chart_names_lock = Lock()
+_custom_chart_names: Optional[List[str]] = None
+
+def _current_chart_names() -> List[str]:
+    with _chart_names_lock:
+        names = _custom_chart_names if _custom_chart_names is not None else DEFAULT_CHART_NAMES
+    return list(names)
+
+def _chart_names_source() -> str:
+    with _chart_names_lock:
+        return "custom" if _custom_chart_names is not None else "default"
+
+def _set_chart_names(names: Optional[List[str]]) -> List[str]:
+    global _custom_chart_names
+    with _chart_names_lock:
+        _custom_chart_names = names
+    return _current_chart_names()
 
 # ===== 시스템 프롬프트 빌더 =====
 def build_system_prompt(target_lang: str,
@@ -337,6 +383,10 @@ def build_system_prompt(target_lang: str,
         "GLOSSARY (Tag-Table, target-specific JSON). If a source sentence contains a key "
         "or its natural variants, you MUST output the exact mapped value:\n"
         + json.dumps(table, ensure_ascii=False, indent=2) + "\n\n"
+
+        "PLACEHOLDER TOKENS:\n"
+        "- You may see tokens like [[TAG12]] in the input. They already encode the exact translation.\n"
+        "- COPY THEM EXACTLY AS-IS in your output. Do not translate, edit, or remove them.\n\n"
 
         # Protected tokens and proper nouns
         "PROTECTED (NEVER translate; keep verbatim, preserve casing):\n"
@@ -657,7 +707,8 @@ def translate_nllb(text: str, src: str, tgt: str) -> str:
     # Spanish styling: replace '-' and '_' with spaces for translated terms only –
     if tgt == "es":
         out = out.replace("-", " ").replace("_", " ")
-    return postprocess_output(out, tgt, text)
+    out = postprocess_output(out, tgt, text)
+    return out
 
 
 def _score_for_lang(segment: str, target: str) -> int:
@@ -763,6 +814,10 @@ class TranslateReq(BaseModel):
     authors: Optional[List[str]] = None
     chart_names: Optional[List[str]] = None
 
+class ChartNamesUpdateReq(BaseModel):
+    chart_names: Optional[List[str]] = None
+    reset: Optional[bool] = False
+
 @app.post("/translate")
 def translate(req: TranslateReq):
     assert req.source in LANGS and req.target in LANGS, "unsupported language"
@@ -773,7 +828,7 @@ def translate(req: TranslateReq):
         ex.extend([e.model_dump() for e in req.examples])
 
     authors = req.authors or DEFAULT_AUTHORS
-    chart_names = req.chart_names or DEFAULT_CHART_NAMES
+    chart_names = req.chart_names or _current_chart_names()
 
     if BACKEND == "nllb":
         out = translate_nllb(req.text, req.source, req.target)
@@ -784,7 +839,45 @@ def translate(req: TranslateReq):
         out = generate(messages)
         out = _restore_placeholders(out, ph)
         out = postprocess_output(out, req.target, req.text)
+    out = _enforce_tag_glossary(out, req.source, req.target)
     return {"source": req.source, "target": req.target, "text": req.text, "translated": out}
+
+@app.get("/chart_names")
+def get_chart_names():
+    return {"chart_names": _current_chart_names(), "source": _chart_names_source()}
+
+@app.post("/chart_names")
+def set_chart_names(req: ChartNamesUpdateReq):
+    if req.reset:
+        names = _set_chart_names(None)
+        return {"chart_names": names, "source": _chart_names_source()}
+    if not req.chart_names:
+        raise HTTPException(status_code=400, detail="chart_names must be provided unless reset=true.")
+    cleaned: List[str] = []
+    for item in req.chart_names:
+        if not item:
+            continue
+        value = item.strip()
+        if not value:
+            continue
+        if len(value) > MAX_CHART_NAME_LEN:
+            preview = value[:32]
+            if len(value) > 32:
+                preview += "..."
+            raise HTTPException(
+                status_code=400,
+                detail=f"Chart name '{preview}' exceeds {MAX_CHART_NAME_LEN} characters.",
+            )
+        cleaned.append(value)
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="chart_names must include at least one non-empty entry.")
+    if len(cleaned) > MAX_CHART_NAME_COUNT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum {MAX_CHART_NAME_COUNT} chart names supported.",
+        )
+    names = _set_chart_names(cleaned)
+    return {"chart_names": names, "source": _chart_names_source()}
 
 
 # ---- Language detection (ko|en|es) ----
