@@ -1,9 +1,14 @@
 from typing import List, Dict, Optional, Tuple
 from fastapi import FastAPI
 from pydantic import BaseModel
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM
 import torch, json, os, re
 from dotenv import load_dotenv
+
+try:
+    from transformers import BitsAndBytesConfig
+except Exception:
+    BitsAndBytesConfig = None  # type: ignore
 
 app = FastAPI(title="RhythmGame Translation (Prompt-only, TagBank+Rules+Examples)")
 
@@ -31,6 +36,24 @@ def _detect_gpu_info() -> Dict[str, Optional[str]]:
             pass
     return {"name": name, "vram_gb": vram_gb}
 
+def _has_mps() -> bool:
+    mps_backend = getattr(torch.backends, "mps", None)
+    if not mps_backend:
+        return False
+    try:
+        return bool(mps_backend.is_available() and mps_backend.is_built())
+    except AttributeError:
+        return bool(mps_backend.is_available())
+
+def _preferred_torch_dtype() -> torch.dtype:
+    if torch.cuda.is_available():
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+    if _has_mps():
+        return torch.float16
+    return torch.float32
+
 GPU_PROFILE = os.getenv("GPU_PROFILE", "").strip().lower()  # e.g. "3080" | "5090"
 BACKEND = os.getenv("BACKEND", "llm").strip().lower()       # "llm"(default) | "nllb"
 SD_STRIP_ENABLED = os.getenv("SD_STRIP_ENABLED", "1").strip().lower() in {"1","true","yes","y","on"}
@@ -51,6 +74,10 @@ GPU_MODEL_PRESETS = {
 MODEL_NAME = os.getenv("MODEL_NAME")
 USE_4BIT = None  # type: Optional[bool]
 gpu_info = _detect_gpu_info()
+HAS_CUDA = torch.cuda.is_available()
+HAS_MPS = _has_mps()
+DEVICE_HINT = "cuda" if HAS_CUDA else ("mps" if HAS_MPS else "cpu")
+DEVICE_MAP_AUTO = "auto" if (HAS_CUDA or HAS_MPS) else None
 MAX_NEW_TOKENS = 2048
 
 if BACKEND == "nllb":
@@ -63,12 +90,13 @@ if BACKEND == "nllb":
             vram = gpu_info.get("vram_gb") or 0
             MODEL_NAME = "facebook/nllb-200-3.3B" if vram >= 20 else "facebook/nllb-200-distilled-1.3B"
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+    dtype = torch.float16 if (HAS_CUDA or HAS_MPS) else torch.float32
     model = AutoModelForSeq2SeqLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=(torch.float16 if torch.cuda.is_available() else None),
-        device_map="auto",
+        torch_dtype=dtype,
+        device_map=DEVICE_MAP_AUTO,
     )
-    print(f"[Model] BACKEND=nllb MODEL_NAME={MODEL_NAME} GPU_PROFILE={GPU_PROFILE} CUDA_GPU={gpu_info}")
+    print(f"[Model] BACKEND=nllb MODEL_NAME={MODEL_NAME} GPU_PROFILE={GPU_PROFILE} CUDA_GPU={gpu_info} DEVICE={DEVICE_HINT}")
 else:
     # LLM backend (default to 4bit for large models)
     if not MODEL_NAME:
@@ -83,21 +111,34 @@ else:
                 MODEL_NAME = "Qwen/Qwen2.5-14B-Instruct"
             else:
                 MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
-    USE_4BIT = _get_env_bool("USE_4BIT", True)
-    bnb_cfg = BitsAndBytesConfig(
-        load_in_4bit=USE_4BIT,
-        bnb_4bit_compute_dtype=(torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16),
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-    )
+    USE_4BIT = _get_env_bool("USE_4BIT", HAS_CUDA)
+    bnb_cfg = None
+    if USE_4BIT:
+        if not HAS_CUDA:
+            print("[Model] Requested 4-bit quantization but CUDA is unavailable; falling back to full precision.")
+            USE_4BIT = False
+        elif BitsAndBytesConfig is None:
+            print("[Model] bitsandbytes is missing; disabling 4-bit quantization.")
+            USE_4BIT = False
+        else:
+            bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=(torch.bfloat16 if (HAS_CUDA and torch.cuda.is_bf16_supported()) else torch.float16),
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+    dtype = None if USE_4BIT else _preferred_torch_dtype()
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        quantization_config=bnb_cfg if USE_4BIT else None,
-        torch_dtype=(torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16) if not USE_4BIT else None,
-        device_map="auto",
+        quantization_config=bnb_cfg,
+        torch_dtype=dtype,
+        device_map=DEVICE_MAP_AUTO,
     )
-    print(f"[Model] BACKEND=llm MODEL_NAME={MODEL_NAME}, USE_4BIT={USE_4BIT}, GPU_PROFILE={GPU_PROFILE}, CUDA_GPU={gpu_info}")
+    device_desc = DEVICE_HINT
+    if USE_4BIT:
+        device_desc = f"{device_desc}+4bit"
+    print(f"[Model] BACKEND=llm MODEL_NAME={MODEL_NAME}, USE_4BIT={USE_4BIT}, DEVICE={device_desc}, GPU_PROFILE={GPU_PROFILE}, CUDA_GPU={gpu_info}")
 
 LANGS = {"ko", "en", "es"}
 
