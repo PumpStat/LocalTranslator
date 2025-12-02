@@ -241,14 +241,17 @@ PROTECTED_PATTERNS = [
 ]
 
 
-def _apply_placeholders(text: str, src: str, tgt: str, preserve_digits: bool = True) -> Tuple[str, Dict[str, str]]:
+def _apply_placeholders(text: str, src: str, tgt: str, preserve_digits: bool = True) -> Tuple[str, Dict[str, str], List[str]]:
     # Tag placeholders
     placeholders: Dict[str, str] = {}
+    placeholder_order: List[str] = []
     used = 0
     def new_ph() -> str:
         nonlocal used
         used += 1
-        return f"[[TAG{used}]]"
+        ph = f"[[TAG{used}]]"
+        placeholder_order.append(ph)
+        return ph
 
     table = tag_table_for_target(tgt)          # EN key → target surface
     src_map = _build_source_tag_map(src)       # source surface → EN key
@@ -297,7 +300,7 @@ def _apply_placeholders(text: str, src: str, tgt: str, preserve_digits: bool = T
             p = re.sub(r"\d+", _numrepl, p)
             out_parts.append(p)
         text = "".join(out_parts)
-    return text, placeholders
+    return text, placeholders, placeholder_order
 
 
 def _restore_placeholders(text: str, placeholders: Dict[str, str]) -> str:
@@ -315,6 +318,17 @@ def _restore_placeholders(text: str, placeholders: Dict[str, str]) -> str:
         # Replace [TAGn] variants (case-insensitive)
         restored = re.sub(rf"(?i)\[\s*TAG\s*{n}\s*\]", val, restored)
     return restored
+
+def _ensure_placeholder_tokens(text: str, placeholder_tokens: List[str]) -> str:
+    if not placeholder_tokens:
+        return text
+    missing = [ph for ph in placeholder_tokens if ph not in text]
+    if not missing:
+        return text
+    prefix = " ".join(missing)
+    if text:
+        return f"{prefix} {text}"
+    return prefix
 
 
 def _enforce_tag_glossary(text: str, src: str, tgt: str) -> str:
@@ -589,7 +603,8 @@ DEFAULT_EXAMPLES = [
 def build_messages(src: str, tgt: str, text: str,
                    examples: List[Dict[str, str]],
                    authors: List[str],
-                   chart_names: List[str]) -> list:
+                   chart_names: List[str],
+                   placeholder_tokens: Optional[List[str]] = None) -> list:
     SELECT_SENTENCE = 40
     sys = build_system_prompt(tgt, authors, chart_names)
     msgs = [{"role": "system", "content": sys}]
@@ -635,7 +650,16 @@ def build_messages(src: str, tgt: str, text: str,
         msgs.append({"role":"user","content":f"Translate from {ex_src} to {ex_tgt}:\n{ex_in}"})
         msgs.append({"role":"assistant","content":ex_out})
 
-    msgs.append({"role": "user", "content": f"Translate from {src} to {tgt}:\n{text}"})
+    user_content = f"Translate from {src} to {tgt}:\n{text}"
+    if placeholder_tokens:
+        tokens_str = ", ".join(placeholder_tokens[:50])
+        user_content += (
+            "\n\nIMPORTANT: The text contains placeholder tokens "
+            f"{tokens_str}. Copy each placeholder EXACTLY once; do not edit or drop them."
+        )
+        if len(placeholder_tokens) > 50:
+            user_content += " (list truncated)"
+    msgs.append({"role": "user", "content": user_content})
     return msgs
 
 def generate(messages: list) -> str:
@@ -659,7 +683,7 @@ def generate(messages: list) -> str:
 
 def translate_nllb(text: str, src: str, tgt: str) -> str:
     # Glossary/protected placeholders
-    t_in, ph = _apply_placeholders(text, src, tgt)
+    t_in, ph, placeholder_tokens = _apply_placeholders(text, src, tgt)
     # NLLB language codes
     src_code = NLLB_CODES[src]
     tgt_code = NLLB_CODES[tgt]
@@ -703,6 +727,7 @@ def translate_nllb(text: str, src: str, tgt: str) -> str:
         gen_kwargs["forced_bos_token_id"] = forced_bos
     gen = model.generate(**inputs, **gen_kwargs)
     out = tokenizer.batch_decode(gen, skip_special_tokens=True)[0]
+    out = _ensure_placeholder_tokens(out, placeholder_tokens)
     out = _restore_placeholders(out, ph)
     # Spanish styling: replace '-' and '_' with spaces for translated terms only –
     if tgt == "es":
@@ -834,9 +859,20 @@ def translate(req: TranslateReq):
         out = translate_nllb(req.text, req.source, req.target)
     else:
         # LLM path: apply placeholders to preserve glossary/protected (leave digits inline)
-        t_in, ph = _apply_placeholders(req.text, req.source, req.target, preserve_digits=False)
-        messages = build_messages(req.source, req.target, t_in, ex, authors, chart_names)
+        t_in, ph, placeholder_tokens = _apply_placeholders(
+            req.text, req.source, req.target, preserve_digits=False
+        )
+        messages = build_messages(
+            req.source,
+            req.target,
+            t_in,
+            ex,
+            authors,
+            chart_names,
+            placeholder_tokens=placeholder_tokens,
+        )
         out = generate(messages)
+        out = _ensure_placeholder_tokens(out, placeholder_tokens)
         out = _restore_placeholders(out, ph)
         out = postprocess_output(out, req.target, req.text)
     out = _enforce_tag_glossary(out, req.source, req.target)
