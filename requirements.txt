@@ -7,3 +7,4 @@ bitsandbytes>=0.43.0
 sentencepiece
 python-dotenv
 protobuf
+peft>=0.10.0

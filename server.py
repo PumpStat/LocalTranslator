@@ -112,7 +112,7 @@ TAGS_EN = [
   "hard chart","easy chart","potion","micro-desync",
   "top","high","upper mid","mid","lower mid","low","bottom",
   "technical footwork","gallop","early spike","mid spike","late spike",
-  "expert","advanced","intermediate","top line"
+  "expert","advanced","intermediate","top line","judgment","sightread"
 ]
 TAGS_KO = [
   "떨기","기믹","틀기","겹발","사이드","폭타","체력","하프","체중이동",
@@ -121,7 +121,7 @@ TAGS_KO = [
   "불곡","물곡","포션","즈레",
   "최상급","상급","중상급","중급","중하급","하급","최하급",
   "각력","말타기","초살","중살","후살",
-  "익퍼","어드","인터","최상 라인"
+  "익퍼","어드","인터","최상 라인","판정","초견"
 ]
 assert len(TAGS_EN) == len(TAGS_KO)
 
@@ -141,7 +141,8 @@ ES_DIRECT = {
   "technical footwork":"juego de pies técnico",
   "gallop":"galope",
   "early spike":"pico temprano","mid spike":"pico medio","late spike":"pico tardío",
-  "expert":"expert","advanced":"advanced","intermediate":"intermediate"
+  "expert":"expert","advanced":"advanced","intermediate":"intermediate",
+  "top line":"top line","judgment":"judgment","sightread":"a primera vista"
 }
 
 TAG_MAP_EN2KO = dict(zip(TAGS_EN, TAGS_KO))
@@ -481,6 +482,16 @@ DEFAULT_EXAMPLES = [
     {"source": "ko", "target": "en",
      "input": "23최상 라인보단 쉬운 곡",
      "output": "Easier than the 23 top line."},
+
+    # 쌍 34 — KO→EN: 판정 → timing/judgment nuance
+    {"source": "ko", "target": "en",
+     "input": "폭타 할만한데 판정이 다 나가네요...",
+     "output": "The runs are doable, but the timing feels completely off..."},
+
+    # 쌍 35 — KO→EN: 현지인/초견/체력
+    {"source": "ko", "target": "en",
+     "input": "현지인이라면 초견에 깰 수 있음. 체력 얼마 안들어요",
+     "output": "Locals can clear it on sightread. It doesn't require much stamina."},
 ]
 
 # ---- 메시지 빌더 ----
@@ -488,7 +499,7 @@ def build_messages(src: str, tgt: str, text: str,
                    examples: List[Dict[str, str]],
                    authors: List[str],
                    chart_names: List[str]) -> list:
-    SELECT_SENTENCE = 33
+    SELECT_SENTENCE = 40
     sys = build_system_prompt(tgt, authors, chart_names)
     msgs = [{"role": "system", "content": sys}]
 
