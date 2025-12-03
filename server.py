@@ -79,7 +79,7 @@ HAS_CUDA = torch.cuda.is_available()
 HAS_MPS = _has_mps()
 DEVICE_HINT = "cuda" if HAS_CUDA else ("mps" if HAS_MPS else "cpu")
 DEVICE_MAP_AUTO = "auto" if (HAS_CUDA or HAS_MPS) else None
-MAX_NEW_TOKENS = 2048
+MAX_NEW_TOKENS = 1024
 
 if BACKEND == "nllb":
     if not MODEL_NAME:
