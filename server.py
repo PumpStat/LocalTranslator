@@ -191,6 +191,8 @@ TAG_MAP_EN2KO = dict(zip(TAGS_EN, TAGS_KO))
 TAG_MAP_KO2EN = dict(zip(TAGS_KO, TAGS_EN))
 TAG_MAP_EN2ES = ES_DIRECT
 KO_DIFFICULTY_ABBREVS = {"익퍼", "어드", "인터"}
+SPANISH_LATIN1 = set("áéíóúüñÁÉÍÓÚÜÑ¿¡")
+ALLOWED_PUNCT = set(",.!?;:'\"()[]{}-_/+&%$#@=*`~^|\\")
 
 def tag_table_for_target(tgt: str) -> Dict[str, str]:
     table = {}
@@ -224,6 +226,108 @@ def _build_source_tag_map(src: str) -> Dict[str, str]:
     elif src == "es":
         for en, es in ES_DIRECT.items(): m[es] = en
     return m
+
+
+def _is_hangul_char(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0xAC00 <= code <= 0xD7A3
+        or 0x1100 <= code <= 0x11FF
+        or 0x3130 <= code <= 0x318F
+    )
+
+
+def _sanitize_prompt_text(text: str) -> str:
+    """
+    Remove characters outside KO/EN/ES alphabets, digits, whitespace, and a safe punctuation list.
+    Helps prevent emojis or other glyphs from derailing the LLM prompt.
+    """
+    buf = []
+    for ch in text:
+        code = ord(ch)
+        if ch.isdigit() or ch.isspace():
+            buf.append(ch)
+            continue
+        if ch in ALLOWED_PUNCT or ch in SPANISH_LATIN1:
+            buf.append(ch)
+            continue
+        cl = ch.lower()
+        if "a" <= cl <= "z":
+            buf.append(ch)
+            continue
+        if _is_hangul_char(ch):
+            buf.append(ch)
+            continue
+        # drop special symbol/emoji/etc.
+    sanitized = "".join(buf)
+    if sanitized.strip():
+        return sanitized
+    return text
+
+
+def _char_category(ch: str) -> str:
+    if ch.isdigit():
+        return "digit"
+    cl = ch.lower()
+    if "a" <= cl <= "z":
+        return "latin"
+    if _is_hangul_char(ch):
+        return "hangul"
+    return "other"
+
+
+def _sentence_case_first_segment(text: str) -> str:
+    chars = list(text)
+    first_idx = None
+    for i, ch in enumerate(chars):
+        if _char_category(ch) in {"latin", "hangul"}:
+            first_idx = i
+            break
+    if first_idx is None:
+        return text
+    chars[first_idx] = chars[first_idx].upper()
+    for j in range(first_idx + 1, len(chars)):
+        if chars[j] == ".":
+            break
+        if _char_category(chars[j]) == "latin":
+            chars[j] = chars[j].lower()
+    return "".join(chars)
+
+
+def _insert_spaces_between_scripts(text: str) -> str:
+    if not text:
+        return text
+    out = []
+    prev = None
+    for ch in text:
+        if prev is not None:
+            prev_cat = _char_category(prev)
+            curr_cat = _char_category(ch)
+            needs_space = False
+            pairs = {prev_cat, curr_cat}
+            if "digit" in pairs and (("latin" in pairs) or ("hangul" in pairs)):
+                needs_space = True
+                # Preserve Sxx/Dxx tokens
+                if prev_cat == "latin" and curr_cat == "digit" and prev.lower() in {"s", "d"}:
+                    needs_space = False
+                if curr_cat == "latin" and prev_cat == "digit" and ch.lower() in {"s", "d"}:
+                    needs_space = False
+            if needs_space and (not out or out[-1] != " "):
+                out.append(" ")
+        out.append(ch)
+        prev = ch
+    spaced = "".join(out)
+    spaced = re.sub(r"\s{2,}", " ", spaced)
+    spaced = re.sub(r"\s+([,.;:!?])", r"\1", spaced)
+    return spaced.strip()
+
+
+def _tidy_translated_text(text: str) -> str:
+    if not text:
+        return text
+    sentence_cased = _sentence_case_first_segment(text)
+    spaced = _insert_spaces_between_scripts(sentence_cased)
+    return spaced
 
 
 PROTECTED_PATTERNS = [
@@ -409,9 +513,14 @@ def build_system_prompt(target_lang: str,
 
         "DIFFICULTY ABBREVIATIONS (익퍼/어드/인터):\n"
         "- These Korean nicknames map to the same tiers as expert, advanced, and intermediate.\n"
-        "- Translate them into the appropriate target-language tier (e.g., EN: Expert/Advanced/Intermediate, ES: Expert/Advanced/Intermediate).\n"
-        "- When they attach directly to numbers (e.g., '어드8', '익퍼1', '인터10'), output them as '<tier> <number>' such as 'Advanced 8' or 'Expert 1'. Keep the digits exactly as given.\n"
+        "- Translate them into the appropriate target-language tier (e.g., EN: Expert/Advanced/Intermediate, ES: Experto/Avanzado/Intermedio).\n"
+        "- When they attach directly to numbers (e.g., '어드8', '익퍼1', '인터10'), output them as '<tier> <number>' such as 'Advanced 8' or 'Experto 1'. Keep the digits exactly as given.\n"
         "- Treat them as ordinary words; do not rely on placeholders to translate them.\n\n"
+
+        "SINGLE TARGET OUTPUT:\n"
+        "- Provide exactly ONE translation in the target language.\n"
+        "- Never list multiple languages, label outputs with 'en/ko/es', or add alternative translations separated by '/', '|', or commas.\n"
+        "- If you catch yourself offering multiple variants, keep only the correct target-language rendition and drop the rest.\n\n"
 
         # Rules
         "SPECIAL RULES:\n"
@@ -655,15 +764,19 @@ def build_messages(src: str, tgt: str, text: str,
         msgs.append({"role":"user","content":f"Translate from {ex_src} to {ex_tgt}:\n{ex_in}"})
         msgs.append({"role":"assistant","content":ex_out})
 
-    user_content = f"Translate from {src} to {tgt}:\n{text}"
     if placeholder_tokens:
         tokens_str = ", ".join(placeholder_tokens[:50])
-        user_content += (
-            "\n\nIMPORTANT: The text contains placeholder tokens "
-            f"{tokens_str}. Copy each placeholder EXACTLY once; do not edit or drop them."
+        notice = (
+            "PLACEHOLDER NOTICE:\n"
+            f"The source text includes placeholder tokens: {tokens_str}.\n"
+            "Copy each placeholder EXACTLY once; do not edit or drop them.\n"
+            "DO NOT translate this notice; it is meta-instruction only."
         )
         if len(placeholder_tokens) > 50:
-            user_content += " (list truncated)"
+            notice += " (list truncated)"
+        msgs.append({"role": "system", "content": notice})
+
+    user_content = f"Translate from {src} to {tgt}:\n{text}"
     msgs.append({"role": "user", "content": user_content})
     return msgs
 
@@ -689,6 +802,7 @@ def generate(messages: list) -> str:
 def translate_nllb(text: str, src: str, tgt: str) -> str:
     # Glossary/protected placeholders
     t_in, ph, placeholder_tokens = _apply_placeholders(text, src, tgt)
+    t_clean = _sanitize_prompt_text(t_in)
     # NLLB language codes
     src_code = NLLB_CODES[src]
     tgt_code = NLLB_CODES[tgt]
@@ -697,7 +811,7 @@ def translate_nllb(text: str, src: str, tgt: str) -> str:
         tokenizer.src_lang = src_code  # NLLB/mBART style
     except Exception:
         pass
-    inputs = tokenizer(t_in, return_tensors="pt")
+    inputs = tokenizer(t_clean, return_tensors="pt")
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     # Resolve forced BOS token id robustly across tokenizers
     def _get_forced_bos_id(tok, code: str) -> Optional[int]:
@@ -796,6 +910,15 @@ def postprocess_output(text: str, target: str, source_text: str) -> str:
         for seg in candidates:
             tmp.extend([s.strip() for s in seg.split(sep) if s.strip()])
         candidates = tmp
+    # Split slash-joined multilingual outputs into separate candidates but keep the original too
+    slash_seps = [" / "]
+    for sep in slash_seps:
+        tmp = []
+        for seg in candidates:
+            tmp.append(seg)
+            if sep in seg:
+                tmp.extend([s.strip() for s in seg.split(sep) if s.strip()])
+        candidates = tmp
     if not candidates:
         return cleaned
     # Choose the segment that best matches target language
@@ -804,6 +927,7 @@ def postprocess_output(text: str, target: str, source_text: str) -> str:
     src_has_bad = any(_contains_bad(source_text, l) for l in ("ko", "en", "es"))
     if not src_has_bad and _contains_bad(best, target):
         best = _censor(best, target)
+    best = _tidy_translated_text(best)
     # Do not append algorithmic fragments like 'for a N.'; rely on instructions/few-shot instead.
     # # Strip inferred S/D prefixes that do not exist in the source (case-insensitive, allow spaces/hyphen)
     # if SD_STRIP_ENABLED:
@@ -867,10 +991,11 @@ def translate(req: TranslateReq):
         t_in, ph, placeholder_tokens = _apply_placeholders(
             req.text, req.source, req.target, preserve_digits=False
         )
+        t_clean = _sanitize_prompt_text(t_in)
         messages = build_messages(
             req.source,
             req.target,
-            t_in,
+            t_clean,
             ex,
             authors,
             chart_names,
