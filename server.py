@@ -190,6 +190,7 @@ ES_DIRECT = {
 TAG_MAP_EN2KO = dict(zip(TAGS_EN, TAGS_KO))
 TAG_MAP_KO2EN = dict(zip(TAGS_KO, TAGS_EN))
 TAG_MAP_EN2ES = ES_DIRECT
+KO_DIFFICULTY_ABBREVS = {"익퍼", "어드", "인터"}
 
 def tag_table_for_target(tgt: str) -> Dict[str, str]:
     table = {}
@@ -212,7 +213,10 @@ def _build_source_tag_map(src: str) -> Dict[str, str]:
     if src == "en":
         for en in TAGS_EN: m[en] = en
     elif src == "ko":
-        for ko, en in TAG_MAP_KO2EN.items(): m[ko] = en
+        for ko, en in TAG_MAP_KO2EN.items():
+            if ko in KO_DIFFICULTY_ABBREVS:
+                continue
+            m[ko] = en
         # Variants/synonyms for KO → EN mapping
         m.update({
             "최상라인": "top line",
@@ -402,6 +406,12 @@ def build_system_prompt(target_lang: str,
         "- Standalone Korean terms like '최상', '상', '중상', '중', '중하', '하', '최하' denote the same tiers as '최상급'~'최하급'.\n"
         "- Interpret them contextually as: 최상→top, 상→high, 중상→upper mid, 중→mid, 중하→lower mid, 하→low, 최하→bottom.\n"
         "- ONLY translate them when they appear as complete difficulty descriptors. If they are part of another word (e.g., '집중'), leave them as-is.\n\n"
+
+        "DIFFICULTY ABBREVIATIONS (익퍼/어드/인터):\n"
+        "- These Korean nicknames map to the same tiers as expert, advanced, and intermediate.\n"
+        "- Translate them into the appropriate target-language tier (e.g., EN: Expert/Advanced/Intermediate, ES: Expert/Advanced/Intermediate).\n"
+        "- When they attach directly to numbers (e.g., '어드8', '익퍼1', '인터10'), output them as '<tier> <number>' such as 'Advanced 8' or 'Expert 1'. Keep the digits exactly as given.\n"
+        "- Treat them as ordinary words; do not rely on placeholders to translate them.\n\n"
 
         # Rules
         "SPECIAL RULES:\n"
@@ -666,7 +676,7 @@ def generate(messages: list) -> str:
         out = model.generate(
             **inputs,
             max_new_tokens=MAX_NEW_TOKENS,
-            temperature=0.0, top_p=1.0, do_sample=False,
+            do_sample=False,
             repetition_penalty=1.05,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
