@@ -217,16 +217,6 @@ def _build_source_tag_map(src: str) -> Dict[str, str]:
         m.update({
             "최상라인": "top line",
         })
-        # Short-form difficulty aliases (KO → EN)
-        m.update({
-            "최상": "top",
-            "상": "high",
-            "중상": "upper mid",
-            "중": "mid",
-            "중하": "lower mid",
-            "하": "low",
-            "최하": "bottom",
-        })
     elif src == "es":
         for en, es in ES_DIRECT.items(): m[es] = en
     return m
@@ -407,6 +397,11 @@ def build_system_prompt(target_lang: str,
         "- S1~S26, D1~D28, Coop2~Coop5, C2~C5, BPM\n"
         f"- Chart authors (proper nouns): {authors}\n"
         f"- Chart names (proper nouns): {chart_names}\n\n"
+
+        "DIFFICULTY SHORTHANDS WITHOUT '급':\n"
+        "- Standalone Korean terms like '최상', '상', '중상', '중', '중하', '하', '최하' denote the same tiers as '최상급'~'최하급'.\n"
+        "- Interpret them contextually as: 최상→top, 상→high, 중상→upper mid, 중→mid, 중하→lower mid, 하→low, 최하→bottom.\n"
+        "- ONLY translate them when they appear as complete difficulty descriptors. If they are part of another word (e.g., '집중'), leave them as-is.\n\n"
 
         # Rules
         "SPECIAL RULES:\n"
