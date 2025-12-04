@@ -846,6 +846,7 @@ def translate_nllb(text: str, src: str, tgt: str) -> str:
         gen_kwargs["forced_bos_token_id"] = forced_bos
     gen = model.generate(**inputs, **gen_kwargs)
     out = tokenizer.batch_decode(gen, skip_special_tokens=True)[0]
+    gen = gen.detach().cpu()
     out = _ensure_placeholder_tokens(out, placeholder_tokens)
     out = _restore_placeholders(out, ph)
     # Spanish styling: replace '-' and '_' with spaces for translated terms only –
